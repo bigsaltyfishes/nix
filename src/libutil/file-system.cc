@@ -27,6 +27,33 @@
 
 #include "strings-inline.hh"
 
+#if __FreeBSD__
+#include <sys/param.h>
+#include <sys/mount.h>
+
+namespace nix {
+
+void unmountAll(const std::filesystem::path& path)
+{
+    int count;
+    struct statfs* mntbuf;
+    if ((count = getmntinfo(&mntbuf, MNT_WAIT)) < 0) {
+        throw SysError("Couldn't list mounts while unmounting %1%", path.string());
+    }
+
+    for (int i = 0; i < count; i++) {
+        Path mounted(mntbuf[i].f_mntonname);
+        if (mounted.starts_with(path.string())) {
+            if (unmount(mounted.c_str(), 0) < 0) {
+                throw SysError("Failed to unmount path %1%", mounted);
+            }
+        }
+    }
+}
+
+}
+#endif
+
 namespace nix {
 
 namespace fs { using namespace std::filesystem; }
@@ -507,6 +534,9 @@ AutoDelete::~AutoDelete()
 {
     try {
         if (del) {
+#if __FreeBSD__
+            unmountAll(_path);
+#endif
             if (recursive)
                 deletePath(_path);
             else {

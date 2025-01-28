@@ -86,7 +86,7 @@ Settings::Settings()
         builders = concatStringsSep("\n", ss);
     }
 
-#if defined(__linux__) && defined(SANDBOX_SHELL)
+#if (__linux__ || __FreeBSD__) && defined(SANDBOX_SHELL)
     sandboxPaths = tokenizeString<StringSet>("/bin/sh=" SANDBOX_SHELL);
 #endif
 
