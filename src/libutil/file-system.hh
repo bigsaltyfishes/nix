@@ -294,6 +294,22 @@ inline void replaceSymlink(const Path & target, const Path & link)
  */
 void moveFile(const Path & src, const Path & dst);
 
+#if __FreeBSD__
+struct CopyFileFlags
+{
+    /**
+     * Delete the file after copying.
+     */
+    bool deleteAfter = false;
+
+    /**
+     * Follow symlinks and copy the eventual target.
+     */
+    bool followSymlinks = false;
+};
+void copyFile(const Path & oldPath, const Path & newPath, CopyFileFlags flags);
+#endif
+
 /**
  * Recursively copy the content of `oldPath` to `newPath`. If `andDelete` is
  * `true`, then also remove `oldPath` (making this equivalent to `moveFile`, but

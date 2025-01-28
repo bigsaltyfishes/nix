@@ -71,7 +71,31 @@ extern "C" int sandbox_init_with_parameters(const char *profile, uint64_t flags,
 #include <sys/param.h>
 #include <sys/jail.h>
 #include <sys/sockio.h>
+#include <sys/mount.h>
 #include <jail.h>
+#include "freebsd-local.hh"
+
+namespace nix {
+
+void unmountAll(Path & path)
+{
+    int count;
+    struct statfs * mntbuf;
+    if ((count = getmntinfo(&mntbuf, MNT_WAIT)) < 0) {
+        throw SysError("Couldn't list mounts while unmounting %1%", path);
+    }
+
+    for (int i = 0; i < count; i++) {
+        Path mounted(mntbuf[i].f_mntonname);
+        if (mounted.starts_with(path)) {
+            if (unmount(mounted.c_str(), 0) < 0) {
+                throw SysError("Failed to unmount path %1%", mounted);
+            }
+        }
+    }
+}
+
+}
 #endif
 
 #include <pwd.h>
@@ -731,6 +755,7 @@ void LocalDerivationGoal::startBuilder()
             pathsInChroot[i] = {i, true};
         }
 
+// PrepareSandbox()
 #if __linux__
         /* Create a temporary directory in which we set up the chroot
            environment using bind-mounts.  We put it in the Nix store
@@ -830,7 +855,221 @@ void LocalDerivationGoal::startBuilder()
 #else
         if (parsedDrv->useUidRange())
             throw Error("feature 'uid-range' is not supported on this platform");
-        #if __APPLE__
+        #if __FreeBSD__
+        	chrootRootDir = worker.store.Store::toRealPath(drvPath) + ".chroot";
+            // Make sure we're prepared if unmount failed previously
+            unmountAll(chrootRootDir);
+
+            // clang-format off
+            std::vector<PasswordEntry> users {{
+                "root",
+                0,
+                0,
+                "Nix build user",
+                settings.sandboxBuildDir,
+                "/noshell"
+            }, {
+                "nixbld",
+                sandboxUid(),
+                sandboxGid(),
+                "Nix build user",
+                settings.sandboxBuildDir,
+                "/noshell"
+            }, {
+                "nobody",
+                65534,
+                65534,
+                "Nobody",
+                "/",
+                "/noshell"
+            }};
+
+            // Don't set chrootRootDir here because on FreeBSD we want to
+            // unmount before deletePath
+            deletePath(chrootRootDir);
+
+            /* Clean up the chroot directory automatically. */
+            autoDelChroot = std::make_shared<AutoDelete>(chrootRootDir);
+
+            printMsg(lvlChatty, "setting up chroot environment in '%1%'", chrootRootDir);
+
+            // FIXME: make this 0700
+            if (mkdir(chrootRootDir.c_str(), buildUser && buildUser->getUIDCount() != 1 ? 0755 : 0750) == -1)
+                throw SysError("cannot create '%1%'", chrootRootDir);
+
+            if (buildUser && chown(chrootRootDir.c_str(), buildUser->getUIDCount() != 1 ? buildUser->getUID() : 0, buildUser->getGID()) == -1)
+                throw SysError("cannot change ownership of '%1%'", chrootRootDir);
+
+            /* Create a writable /tmp in the chroot.  Many builders need
+            this.  (Of course they should really respect $TMPDIR
+            instead.) */
+            Path chrootTmpDir = chrootRootDir + "/tmp";
+            createDirs(chrootTmpDir);
+            chmod_(chrootTmpDir, 01777);
+
+            /* Create a /etc/passwd with entries for the build user and the
+            nobody account.  The latter is kind of a hack to support
+            Samba-in-QEMU. */
+            createDirs(chrootRootDir + "/etc");
+            if (parsedDrv->useUidRange())
+                chownToBuilder(chrootRootDir + "/etc");
+
+            if (parsedDrv->useUidRange() && (!buildUser || buildUser->getUIDCount() < 65536))
+                throw Error("feature 'uid-range' requires the setting '%s' to be enabled", settings.autoAllocateUids.name);
+
+            /* Declare the build user's group so that programs get a consistent
+            view of the system (e.g., "id -gn"). */
+            writeFile(chrootRootDir + "/etc/group",
+                fmt("root:x:0:\n"
+                    "nixbld:!:%1%:\n"
+                    "nogroup:x:65534:\n", sandboxGid()));
+
+            /* Create /etc/hosts with localhost entry. */
+            if (derivationType->isSandboxed())
+                writeFile(chrootRootDir + "/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n");
+
+            /* Make the closure of the inputs available in the chroot,
+            rather than the whole Nix store.  This prevents any access
+            to undeclared dependencies.  Directories are bind-mounted,
+            while other inputs are hard-linked (since only directories
+            can be bind-mounted).  !!! As an extra security
+            precaution, make the fake Nix store only writable by the
+            build user. */
+            Path chrootStoreDir = chrootRootDir + worker.store.storeDir;
+            createDirs(chrootStoreDir);
+            chmod_(chrootStoreDir, 01775);
+
+            if (buildUser && chown(chrootStoreDir.c_str(), 0, buildUser->getGID()) == -1)
+                throw SysError("cannot change ownership of '%1%'", chrootStoreDir);
+
+            for (auto & i : inputPaths) {
+                auto p = worker.store.printStorePath(i);
+                Path r = worker.store.toRealPath(p);
+                pathsInChroot.insert_or_assign(p, r);
+            }
+
+            /* If we're repairing, checking or rebuilding part of a
+            multiple-outputs derivation, it's possible that we're
+            rebuilding a path that is in settings.sandbox-paths
+            (typically the dependencies of /bin/sh).  Throw them
+            out. */
+            for (auto & i : drv->outputsAndOptPaths(worker.store)) {
+                /* If the name isn't known a priori (i.e. floating
+                content-addressed derivation), the temporary location we use
+                should be fresh.  Freshness means it is impossible that the path
+                is already in the sandbox, so we don't need to worry about
+                removing it.  */
+                if (i.second.second)
+                    pathsInChroot.erase(worker.store.printStorePath(*i.second.second));
+            }
+
+            createPasswordFiles(chrootRootDir, users);
+
+            // Linux waits until after entering the child to start mounting so it doesn't
+            // pollute the root mount namespace.
+            // FreeBSD doesn't have mount namespaces, so there's no reason to wait.
+
+            auto devpath = chrootRootDir + "/dev";
+            mkdir(devpath.c_str(), 0555);
+            mkdir((chrootRootDir + "/bin").c_str(), 0555);
+            char errmsg[255] = "";
+            struct iovec iov[8] = {
+                {.iov_base = (void *) "fstype", .iov_len = sizeof("fstype")},
+                {.iov_base = (void *) "devfs", .iov_len = sizeof("devfs")},
+                {.iov_base = (void *) "fspath", .iov_len = sizeof("fspath")},
+                {.iov_base = (void *) devpath.c_str(), .iov_len = devpath.length() + 1},
+                {.iov_base = (void *) "ruleset", .iov_len = sizeof("ruleset")},
+                {.iov_base = (void *) "4", .iov_len = sizeof("4")},
+                {.iov_base = (void *) "errmsg", .iov_len = sizeof("errmsg")},
+                {.iov_base = (void *) errmsg, .iov_len = sizeof(errmsg)},
+            };
+            if (nmount(iov, 6, 0) < 0) {
+                throw SysError("Failed to mount jail /dev: %1%", errmsg);
+            }
+            for (auto & i : pathsInChroot) {
+                char errmsg[255];
+                errmsg[0] = 0;
+
+                if (i.second.source == "/proc") {
+                    continue; // backwards compatibility
+                }
+                auto path = chrootRootDir + i.first;
+
+                struct stat stat_buf;
+                if (stat(i.second.source.c_str(), &stat_buf) < 0) {
+                    throw SysError("stat");
+                }
+
+                // mount points must exist and be the right type
+                if (S_ISDIR(stat_buf.st_mode)) {
+                    createDirs(path);
+                } else {
+                    createDirs(dirOf(path));
+                    writeFile(path, "");
+                }
+
+                struct iovec iov[8] = {
+                    {.iov_base = (void *) "fstype", .iov_len = sizeof("fstype")},
+                    {.iov_base = (void *) "nullfs", .iov_len = sizeof("nullfs")},
+                    {.iov_base = (void *) "fspath", .iov_len = sizeof("fspath")},
+                    {.iov_base = (void *) path.c_str(), .iov_len = path.length() + 1},
+                    {.iov_base = (void *) "target", .iov_len = sizeof("target")},
+                    {.iov_base = (void *) i.second.source.c_str(), .iov_len = i.second.source.length() + 1},
+                    {.iov_base = (void *) "errmsg", .iov_len = sizeof("errmsg")},
+                    {.iov_base = (void *) errmsg, .iov_len = sizeof(errmsg)},
+                };
+                if (nmount(iov, 8, 0) < 0) {
+                    throw SysError("Failed to mount nullfs for %1% - %2%", path, errmsg);
+                }
+            }
+
+            /* Fixed-output derivations typically need to access the
+            network, so give them access to /etc/resolv.conf and so
+            on. */
+            if (!derivationType->isSandboxed()) {
+                // Only use nss functions to resolve hosts and
+                // services. Don’t use it for anything else that may
+                // be configured for this system. This limits the
+                // potential impurities introduced in fixed-outputs.
+                writeFile(chrootRootDir + "/etc/nsswitch.conf", "hosts: files dns\nservices: files\n");
+
+                /* N.B. it is realistic that these paths might not exist. It
+                happens when testing Nix building fixed-output derivations
+                within a pure derivation. */
+                for (auto & path : {"/etc/resolv.conf", "/etc/services", "/etc/hosts"}) {
+                    if (pathExists(path)) {
+                        // Copy the actual file, not the symlink, because we don't know where
+                        // the symlink is pointing, and we don't want to chase down the entire
+                        // chain.
+                        //
+                        // This means if your network config changes during a FOD build,
+                        // the DNS in the sandbox will be wrong. However, this is pretty unlikely
+                        // to actually be a problem, because FODs are generally pretty fast,
+                        // and machines with often-changing network configurations probably
+                        // want to run resolved or some other local resolver anyway.
+                        //
+                        // There's also just no simple way to do this correctly, you have to manually
+                        // inotify watch the files for changes on the outside and update the sandbox
+                        // while the build is running (or at least that's what Flatpak does).
+                        //
+                        // I also just generally feel icky about modifying sandbox state under a build,
+                        // even though it really shouldn't be a big deal. -K900
+                        copyFile(path, chrootRootDir + path, {.followSymlinks = true});
+                    }
+                }
+
+                if (settings.caFile != "" && pathExists(settings.caFile)) {
+                    // For the same reasons as above, copy the CA certificates file too.
+                    // It should be even less likely to change during the build than resolv.conf.
+                    createDirs(chrootRootDir + "/etc/ssl/certs");
+                    copyFile(
+                        settings.caFile,
+                        chrootRootDir + "/etc/ssl/certs/ca-certificates.crt",
+                        {.followSymlinks = true}
+                    );
+                }
+            }
+        #elif __APPLE__
             /* We don't really have any parent prep work to do (yet?)
                All work happens in the child, instead. */
         #else
@@ -1101,6 +1340,12 @@ void LocalDerivationGoal::startBuilder()
         #if __FreeBSD__
             // FreeBSD does not have user namespaces
             usingUserNamespace = false;
+
+            if (useChroot) {
+                if (derivationType->isSandboxed()) {
+                    privateNetwork = true;
+                }
+            }
         #endif
         pid = startProcess([&]() {
             openSlave();
@@ -3165,81 +3410,6 @@ StorePath LocalDerivationGoal::makeFallbackPath(const StorePath & path)
         pathType,
         // pass an all-zeroes hash
         Hash(HashAlgorithm::SHA256), path.name());
-}
-
-void LocalDerivationGoal::basicChrootSetup()
-{
-    // Don't set chrootRootDir here because on FreeBSD we want to
-    // unmount before deletePath
-    deletePath(chrootRootDir);
-
-    /* Clean up the chroot directory automatically. */
-    autoDelChroot = std::make_shared<AutoDelete>(chrootRootDir);
-
-    printMsg(lvlChatty, "setting up chroot environment in '%1%'", chrootRootDir);
-
-    // FIXME: make this 0700
-    if (mkdir(chrootRootDir.c_str(), buildUser && buildUser->getUIDCount() != 1 ? 0755 : 0750) == -1)
-        throw SysError("cannot create '%1%'", chrootRootDir);
-
-    if (buildUser && chown(chrootRootDir.c_str(), buildUser->getUIDCount() != 1 ? buildUser->getUID() : 0, buildUser->getGID()) == -1)
-        throw SysError("cannot change ownership of '%1%'", chrootRootDir);
-
-    /* Create a writable /tmp in the chroot.  Many builders need
-       this.  (Of course they should really respect $TMPDIR
-       instead.) */
-    Path chrootTmpDir = chrootRootDir + "/tmp";
-    createDirs(chrootTmpDir);
-    chmodPath(chrootTmpDir, 01777);
-
-    /* Create a /etc/passwd with entries for the build user and the
-       nobody account.  The latter is kind of a hack to support
-       Samba-in-QEMU. */
-    createDirs(chrootRootDir + "/etc");
-    if (parsedDrv->useUidRange())
-        chownToBuilder(chrootRootDir + "/etc");
-
-    if (parsedDrv->useUidRange() && (!buildUser || buildUser->getUIDCount() < 65536))
-        throw Error("feature 'uid-range' requires the setting '%s' to be enabled", settings.autoAllocateUids.name);
-
-    /* Create /etc/hosts with localhost entry. */
-    if (derivationType->isSandboxed())
-        writeFile(chrootRootDir + "/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n");
-
-    /* Make the closure of the inputs available in the chroot,
-       rather than the whole Nix store.  This prevents any access
-       to undeclared dependencies.  Directories are bind-mounted,
-       while other inputs are hard-linked (since only directories
-       can be bind-mounted).  !!! As an extra security
-       precaution, make the fake Nix store only writable by the
-       build user. */
-    Path chrootStoreDir = chrootRootDir + worker.store.config().storeDir;
-    createDirs(chrootStoreDir);
-    chmodPath(chrootStoreDir, 01775);
-
-    if (buildUser && chown(chrootStoreDir.c_str(), 0, buildUser->getGID()) == -1)
-        throw SysError("cannot change ownership of '%1%'", chrootStoreDir);
-
-    for (auto & i : inputPaths) {
-        auto p = worker.store.printStorePath(i);
-        Path r = worker.store.toRealPath(p);
-        pathsInChroot.insert_or_assign(p, r);
-    }
-
-    /* If we're repairing, checking or rebuilding part of a
-       multiple-outputs derivation, it's possible that we're
-       rebuilding a path that is in settings.sandbox-paths
-       (typically the dependencies of /bin/sh).  Throw them
-       out. */
-    for (auto & i : drv->outputsAndOptPaths(worker.store)) {
-        /* If the name isn't known a priori (i.e. floating
-           content-addressed derivation), the temporary location we use
-           should be fresh.  Freshness means it is impossible that the path
-           is already in the sandbox, so we don't need to worry about
-           removing it.  */
-        if (i.second.second)
-            pathsInChroot.erase(worker.store.printStorePath(*i.second.second));
-    }
 }
 
 }

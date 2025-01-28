@@ -721,6 +721,50 @@ void setWriteTime(const fs::path & path, const struct stat & st)
     setWriteTime(path, st.st_atime, st.st_mtime, S_ISLNK(st.st_mode));
 }
 
+#if __FreeBSD__
+void copy(const fs::directory_entry & from, const fs::path & to, CopyFileFlags flags)
+{
+    // TODO: Rewrite the `is_*` to use `symlink_status()`
+    auto statOfFrom = lstat(from.path().c_str());
+    auto fromStatus = from.symlink_status();
+
+    // Mark the directory as writable so that we can delete its children
+    if (flags.deleteAfter && fs::is_directory(fromStatus)) {
+        fs::permissions(from.path(), fs::perms::owner_write, fs::perm_options::add | fs::perm_options::nofollow);
+    }
+
+
+    if (fs::is_symlink(fromStatus) || fs::is_regular_file(fromStatus)) {
+        auto opts = fs::copy_options::overwrite_existing;
+
+        if (!flags.followSymlinks) {
+            opts |= fs::copy_options::copy_symlinks;
+        }
+
+        fs::copy(from.path(), to, opts);
+    } else if (fs::is_directory(fromStatus)) {
+        fs::create_directory(to);
+        for (auto & entry : fs::directory_iterator(from.path())) {
+            copy(entry, to / entry.path().filename(), flags);
+        }
+    } else {
+        throw Error("file '%s' has an unsupported type", from.path());
+    }
+
+    setWriteTime(to, statOfFrom);
+    if (flags.deleteAfter) {
+        if (!fs::is_symlink(fromStatus))
+            fs::permissions(from.path(), fs::perms::owner_write, fs::perm_options::add | fs::perm_options::nofollow);
+        fs::remove(from.path());
+    }
+}
+
+void copyFile(const Path & oldPath, const Path & newPath, CopyFileFlags flags)
+{
+    return copy(fs::directory_entry(fs::path(oldPath)), fs::path(newPath), flags);
+}
+#endif
+
 void copyFile(const fs::path & from, const fs::path & to, bool andDelete)
 {
     auto fromStatus = fs::symlink_status(from);

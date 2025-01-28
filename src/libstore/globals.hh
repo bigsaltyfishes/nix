@@ -674,7 +674,7 @@ public:
         )"};
 #endif
 
-#if __linux__
+#if __linux__ || __FreeBSD__
     Setting<std::string> sandboxShmSize{
         this, "50%", "sandbox-dev-shm-size",
         R"(
